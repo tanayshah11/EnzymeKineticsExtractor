@@ -1,0 +1,32 @@
+# All the data files
+data/*
+
+# All the .env files
+.env
+
+# All the .json files
+*.json
+
+# All the .csv files
+*.csv
+
+# All the .ipynb files
+*.ipynb
+
+# All the .pyc files
+*.pyc
+
+# All the .pycache files
+*.pycache
+
+# All the .logs files
+*.log
+
+# All the .DS_Store files
+.DS_Store
+
+# Claude files
+.claude/
+
+# .venv files
+.venv/

@@ -1,0 +1,8 @@
+beautifulsoup4
+requests
+fake-useragent
+pandas
+python-dotenv
+google-generativeai
+urllib3
+absl-py
