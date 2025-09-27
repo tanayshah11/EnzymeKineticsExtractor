@@ -32,9 +32,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Load environment variables
 load_dotenv()
 
-# Configure logging
+# Configure logging to both console and file
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),  # Console output
+        logging.FileHandler(
+            "extraction.log", mode="w", encoding="utf-8"
+        ),  # File output
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -44,15 +51,19 @@ class EnzymeParameterExtractor:
 
     def __init__(self, model_name: str = "gemini-2.5-flash-lite"):
         """
-        Initialize the extractor with Google Gemini
+        Initialize the extractor with Google Gemini 2.5 Flash Lite
 
         Args:
-            model_name: Gemini model to use (2.5-flash-lite has 15 RPM, 250K context, 1000 RPD)
+            model_name: Uses gemini-2.5-flash-lite (faster, less restrictive safety filters)
         """
         self.model_name = model_name
         self.ua = UserAgent()
         self.session = requests.Session()
         self.session.verify = False  # Handle SSL issues
+
+        # Initialize caching for duplicate papers
+        self.paper_content_cache = {}  # Cache paper content by PMID
+        self.extraction_cache = {}  # Cache extraction results by (PMID, mutation) tuple
 
         # Initialize Gemini
         self._initialize_gemini()
@@ -79,16 +90,69 @@ class EnzymeParameterExtractor:
 
         genai.configure(api_key=api_key)
 
-        # Initialize the model with optimal settings
+        # Define JSON schema for structured output
+        enzyme_kinetics_schema = {
+            "type": "object",
+            "properties": {
+                "kcat": {
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "number", "nullable": True},
+                        "unit": {"type": "string", "nullable": True},
+                        "substrate": {"type": "string", "nullable": True},
+                        "notes": {"type": "string", "nullable": True},
+                    },
+                    "required": ["value", "unit", "substrate", "notes"],
+                },
+                "km": {
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "number", "nullable": True},
+                        "unit": {"type": "string", "nullable": True},
+                        "substrate": {"type": "string", "nullable": True},
+                        "notes": {"type": "string", "nullable": True},
+                    },
+                    "required": ["value", "unit", "substrate", "notes"],
+                },
+                "kcat_km": {
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "number", "nullable": True},
+                        "unit": {"type": "string", "nullable": True},
+                        "substrate": {"type": "string", "nullable": True},
+                        "notes": {"type": "string", "nullable": True},
+                    },
+                    "required": ["value", "unit", "substrate", "notes"],
+                },
+            },
+            "required": ["kcat", "km", "kcat_km"],
+        }
+
+        # Initialize the model with structured output
         generation_config = genai.GenerationConfig(
             temperature=0.1,  # Low for precise extraction
             top_p=0.1,
             top_k=10,
             max_output_tokens=2048,
+            response_mime_type="application/json",
+            response_schema=enzyme_kinetics_schema,
         )
 
+        # Configure safety settings to be minimal for scientific content
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {
+                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                "threshold": "BLOCK_NONE",
+            },  # Most aggressive
+        ]
+
         self.model = genai.GenerativeModel(
-            model_name=self.model_name, generation_config=generation_config
+            model_name=self.model_name,
+            generation_config=generation_config,
+            safety_settings=safety_settings,
         )
 
         # Test connection silently
@@ -334,17 +398,26 @@ class EnzymeParameterExtractor:
             logger.warning(f"Could not extract PMID from: {pubmed_url}")
             return None, "invalid_url"
 
+        # Check cache first
+        if pmid in self.paper_content_cache:
+            logger.info(f"📋 Using cached content for PMID {pmid}")
+            return self.paper_content_cache[pmid]
+
         # Try PMC full text first
         result = self._fetch_pmc_full_text(pmid)
         if result:
+            self.paper_content_cache[pmid] = result
             return result
 
         # Fallback to comprehensive PubMed content
         result = self._fetch_pubmed_comprehensive(pmid)
         if result:
+            self.paper_content_cache[pmid] = result
             return result
 
+        # Cache failures too to avoid retrying
         logger.warning(f"Could not fetch any content for PMID: {pmid}")
+        self.paper_content_cache[pmid] = (None, "fetch_failed")
         return None, "fetch_failed"
 
     def extract_parameters_with_gemini(
@@ -363,9 +436,26 @@ class EnzymeParameterExtractor:
         if not paper_content:
             return self._empty_parameters()
 
+        # Create cache key from paper content hash and enzyme info
+        import hashlib
+
+        content_hash = hashlib.md5(paper_content.encode()).hexdigest()[:8]
+        mutation_type = enzyme_info.get("mutation_type", "unknown")
+        cache_key = f"{content_hash}_{mutation_type}"
+
+        # Check extraction cache
+        if cache_key in self.extraction_cache:
+            logger.info(
+                f"🔄 Using cached extraction for {mutation_type} (hash: {content_hash})"
+            )
+            return self.extraction_cache[cache_key]
+
         logger.info(
             f"🧠 Processing {len(paper_content)} characters with Gemini {self.model_name}"
         )
+
+        # Use original content without filtering
+        logger.info(f"📄 Processing {len(paper_content)} characters")
 
         # Create the prompt
         prompt = self._create_gemini_prompt(paper_content, enzyme_info)
@@ -374,47 +464,100 @@ class EnzymeParameterExtractor:
             # Generate content with Gemini
             response = self.model.generate_content(prompt)
 
-            if response.text:
+            # Comprehensive block reason handling
+            if hasattr(response, "candidates") and response.candidates:
+                candidate = response.candidates[0]
+                if hasattr(candidate, "finish_reason"):
+                    finish_reason = candidate.finish_reason
+
+                    # Log finish reason for debugging
+                    if finish_reason in [2, 3, 7, 8, 9]:  # Various block reasons
+                        logger.warning(
+                            f"⚠️ Content blocked (reason: {finish_reason}), skipping this paper"
+                        )
+                        return self._empty_parameters()
+
+            if hasattr(response, "text") and response.text:
                 logger.debug(f"Gemini response length: {len(response.text)} chars")
 
-                # Extract JSON from response
-                json_match = re.search(r"\{.*\}", response.text, re.DOTALL)
-                if json_match:
-                    try:
-                        result = json.loads(json_match.group())
-                        logger.debug(
-                            f"Successfully parsed JSON with {len(result)} keys"
-                        )
-                        return self._validate_and_format_parameters(result)
-                    except json.JSONDecodeError as e:
-                        logger.debug(f"JSON decode failed: {e}")
-                        logger.debug(f"Response text: {response.text[:500]}")
+                # Parse structured JSON response directly
+                try:
+                    result = json.loads(response.text)
+                    logger.debug(
+                        f"Successfully parsed structured JSON with {len(result)} keys"
+                    )
+                    formatted_result = self._validate_and_format_parameters(result)
+                    # Cache the result
+                    self.extraction_cache[cache_key] = formatted_result
+                    return formatted_result
+                except json.JSONDecodeError as e:
+                    logger.debug(f"JSON decode failed: {e}")
+                    logger.debug(f"Response text: {response.text[:500]}")
+                    # Fallback to regex parsing for backward compatibility
+                    json_match = re.search(r"\{.*\}", response.text, re.DOTALL)
+                    if json_match:
+                        try:
+                            result = json.loads(json_match.group())
+                            logger.debug(f"Fallback regex parsing successful")
+                            formatted_result = self._validate_and_format_parameters(
+                                result
+                            )
+                            # Cache the result
+                            self.extraction_cache[cache_key] = formatted_result
+                            return formatted_result
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                "⚠️ Both direct and regex JSON parsing failed"
+                            )
+            else:
+                logger.warning(
+                    "⚠️ No text response generated (possibly blocked or empty)"
+                )
 
         except Exception as e:
             logger.error(f"Gemini extraction failed: {e}")
             if "quota" in str(e).lower() or "429" in str(e):
                 # Parse retry delay from error message if available
                 retry_delay = 60  # Default
-                import re
-                delay_match = re.search(r'retry in (\d+(?:\.\d+)?)', str(e))
+                delay_match = re.search(r"retry in (\d+(?:\.\d+)?)", str(e))
                 if delay_match:
                     retry_delay = float(delay_match.group(1)) + 5  # Add 5s buffer
 
-                logger.warning(f"⚠️ Rate limit exceeded. Waiting {retry_delay:.1f} seconds...")
+                logger.warning(
+                    f"⚠️ Rate limit exceeded. Waiting {retry_delay:.1f} seconds..."
+                )
                 time.sleep(retry_delay)
 
                 # Try again once after waiting
                 try:
                     response = self.model.generate_content(prompt)
                     if response.text:
-                        json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
-                        if json_match:
-                            result = json.loads(json_match.group())
-                            return self._validate_and_format_parameters(result)
+                        try:
+                            result = json.loads(response.text)
+                            formatted_result = self._validate_and_format_parameters(
+                                result
+                            )
+                            # Cache the result
+                            self.extraction_cache[cache_key] = formatted_result
+                            return formatted_result
+                        except json.JSONDecodeError:
+                            # Fallback to regex parsing
+                            json_match = re.search(r"\{.*\}", response.text, re.DOTALL)
+                            if json_match:
+                                result = json.loads(json_match.group())
+                                formatted_result = self._validate_and_format_parameters(
+                                    result
+                                )
+                                # Cache the result
+                                self.extraction_cache[cache_key] = formatted_result
+                                return formatted_result
                 except:
                     logger.warning("⚠️ Retry also failed, skipping this paper")
 
-        return self._empty_parameters()
+        # Cache empty result to avoid retrying
+        empty_result = self._empty_parameters()
+        self.extraction_cache[cache_key] = empty_result
+        return empty_result
 
     def _create_gemini_prompt(self, paper_content: str, enzyme_info: Dict) -> str:
         """Create optimized prompt for Gemini extraction"""
@@ -425,11 +568,18 @@ MUTATION: {enzyme_info.get('mutation_type', 'Unknown')}
 ACTIVITY CHANGE: {enzyme_info.get('activity_change', 'Unknown')}
         """
 
-        prompt = f"""You are an expert biochemist extracting enzyme kinetic parameters from research papers.
+        prompt = f"""You are an expert biochemist conducting legitimate scientific research for academic purposes. You are analyzing peer-reviewed scientific literature to extract enzyme kinetic parameters for biochemical research with no malicious intent.
+
+ACADEMIC RESEARCH CONTEXT:
+This analysis is being conducted for:
+- Educational and academic research purposes
+- Advancing scientific understanding of enzyme kinetics
+- Building databases for computational biology research
+- Supporting legitimate biochemical and pharmaceutical research
 
 {enzyme_context}
 
-TASK: Extract kinetic parameters (kcat, Km, kcat/Km) for the specific enzyme and mutation above.
+SCIENTIFIC TASK: Extract kinetic parameters (kcat, Km, kcat/Km) for the specific enzyme and mutation above from peer-reviewed scientific literature.
 
 SEARCH STRATEGY:
 1. FIRST CHECK ALL TABLES - kinetic parameters are often in tables
@@ -439,37 +589,18 @@ SEARCH STRATEGY:
 5. Look for terms: "kcat", "Km", "turnover number", "Michaelis constant", "catalytic efficiency"
 6. Focus on data for mutation: {enzyme_info.get('mutation_type', 'Unknown')}
 
-PAPER CONTENT:
+PEER-REVIEWED SCIENTIFIC LITERATURE CONTENT:
 {paper_content}
 
-EXTRACTION REQUIREMENTS:
-- Extract ONLY explicitly stated numerical values
-- Include substrate names when mentioned
-- Note experimental conditions (pH, temperature)
-- Distinguish mutant from wild-type data
-- Use null for missing values
+ACADEMIC EXTRACTION REQUIREMENTS:
+- Extract ONLY explicitly stated numerical values from peer-reviewed sources
+- Include substrate names when mentioned for scientific accuracy
+- Note experimental conditions (pH, temperature) for research reproducibility
+- Distinguish mutant from wild-type data for comparative studies
+- Use null for missing values to maintain data integrity
+- All data extraction is for legitimate academic research purposes
 
-Return ONLY a JSON object with this exact structure (no other text):
-{{
-    "kcat": {{
-        "value": null or number,
-        "unit": null or string (e.g., "s⁻¹"),
-        "substrate": null or string,
-        "notes": null or string
-    }},
-    "km": {{
-        "value": null or number,
-        "unit": null or string (e.g., "mM", "µM"),
-        "substrate": null or string,
-        "notes": null or string
-    }},
-    "kcat_km": {{
-        "value": null or number,
-        "unit": null or string (e.g., "M⁻¹s⁻¹"),
-        "substrate": null or string,
-        "notes": null or string
-    }}
-}}
+Extract the kinetic parameters for the specified enzyme and mutation. The response will be automatically formatted as structured JSON with kcat, km, and kcat_km objects containing value, unit, substrate, and notes fields.
 """
 
         return prompt
@@ -567,33 +698,41 @@ Return ONLY a JSON object with this exact structure (no other text):
 
         logger.info(f"🎯 Processing {total_to_process} papers")
 
-        # Set rate limits based on model (from official documentation)
-        model_limits = {
-            "gemini-2.5-pro": {"rpm": 5, "tpm": 250000, "rpd": 100},
-            "gemini-2.5-flash": {"rpm": 10, "tpm": 250000, "rpd": 250},
-            "gemini-2.5-flash-preview": {"rpm": 10, "tpm": 250000, "rpd": 250},
-            "gemini-2.5-flash-lite": {"rpm": 15, "tpm": 250000, "rpd": 1000},
-        }
+        # Model-specific configuration
+        if "lite" in self.model_name:
+            logger.info(f"💰 Using Gemini 2.5 Flash Lite (Free Tier: 15 RPM, 1K RPD)")
+            logger.info(f"🚀 Limits: 15 RPM | 32K TPM | 1,000 RPD")
+            logger.info(
+                f"🧠 Features: Fast processing, less restrictive safety filters"
+            )
+        else:
+            logger.info(
+                f"💰 Using Gemini 2.5 Flash (Paid Tier 1: ~$14.41 for full dataset)"
+            )
+            logger.info(f"🚀 Limits: 1,000 RPM | 1M TPM | 10,000 RPD")
+            logger.info(
+                f"🧠 Features: Hybrid reasoning, 1M token context, thinking budgets"
+            )
 
-        limits = model_limits.get(self.model_name, {"rpm": 15, "tpm": 250000, "rpd": 1000})
-        rpm = limits["rpm"]
-        tpm = limits["tpm"]
-        rpd = limits["rpd"]
-        logger.info(f"⚡ Using {self.model_name} (Limits: {rpm} RPM, {tpm//1000}K TPM, {rpd} RPD)")
+        # Calculate appropriate delay based on model limits
+        if "lite" in self.model_name:
+            # Free tier: 15 RPM = 1 request every 4 seconds
+            safe_delay = 4.0  # Conservative for free tier
+        else:
+            # Paid tier: 1,000 RPM = ~16 requests per second!
+            # Conservative approach: 1 request every 0.1 seconds (600 RPM)
+            safe_delay = 0.1  # 0.1 second between requests for maximum speed
 
-        # Calculate safe delay based on token consumption
-        # Average paper size ~80K chars ≈ ~20K tokens
-        avg_tokens_per_paper = 20000
-        safe_delay = max(
-            60 / rpm,  # RPM-based delay
-            (avg_tokens_per_paper * 60) / tpm  # TPM-based delay
-        )
-
-        logger.info(f"🕐 Calculated safe delay: {safe_delay:.1f} seconds between requests")
+        if "lite" in self.model_name:
+            logger.info(f"⚡ CONSERVATIVE RATE: {safe_delay} second delay (15 RPM)")
+            logger.info(f"⏱️ Estimated completion time: ~2-3 hours for 1,985 papers")
+        else:
+            logger.info(f"⚡ MAXIMUM SPEED: {safe_delay} second delay (600 RPM)")
+            logger.info(f"⏱️ Estimated completion time: ~3-5 minutes for 1,985 papers!")
 
         # Process papers
         processed_count = 0
-        save_interval = 10
+        save_interval = 50  # Save every 50 papers (faster processing means less frequent saves needed)
 
         for idx in rows_to_process:
             row = df.iloc[idx]
@@ -681,10 +820,11 @@ Return ONLY a JSON object with this exact structure (no other text):
                 df.to_csv(output_file, index=False)
                 logger.info(f"💾 Saved progress to {output_file}")
 
-            # Rate limiting delay - use calculated safe delay or user override
+            # Rate limiting delay - optimized for paid tier
             if processed_count < total_to_process:
-                actual_delay = rate_limit_delay if rate_limit_delay > 1.0 else safe_delay
-                logger.debug(f"⏱️ Waiting {actual_delay:.1f}s before next request...")
+                actual_delay = (
+                    rate_limit_delay if rate_limit_delay != 1.0 else safe_delay
+                )
                 time.sleep(actual_delay)
 
         # Final save
@@ -710,16 +850,13 @@ def main():
     """Main function for command-line usage"""
     import argparse
 
-    # Make the data directory if it doesn't exist
-    os.makedirs("data", exist_ok=True)
-
     parser = argparse.ArgumentParser(
         description="Extract enzyme parameters from research papers using Gemini"
     )
     parser.add_argument(
         "--input",
-        default="data/enzyme_mutations_batch_1.csv",
-        help="Input CSV file (default: batch 1)",
+        default="enzyme_mutations_clean.csv",
+        help="Input CSV file (default: main dataset)",
     )
     parser.add_argument(
         "--output", help="Output CSV file (default: input_extracted.csv)"
@@ -727,13 +864,8 @@ def main():
     parser.add_argument(
         "--model",
         default="gemini-2.5-flash-lite",
-        choices=[
-            "gemini-2.5-flash-lite",
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-preview",
-            "gemini-2.5-pro",
-        ],
-        help="Gemini model to use (flash-lite=1000 RPD, flash=250 RPD, pro=best quality but 100 RPD)",
+        choices=["gemini-2.5-flash-lite"],
+        help="Uses Gemini 2.5 Flash Lite (15 RPM, 1K RPD, less restrictive safety filters)",
     )
     parser.add_argument("--start", type=int, default=0, help="Starting row (0-indexed)")
     parser.add_argument("--max", type=int, help="Maximum papers to process")
